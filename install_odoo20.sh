@@ -259,7 +259,13 @@ fi
 
 # When serving on 443, also answer plain http:// on port 80 with a redirect
 HTTP_REDIRECT_BLOCK=""
-if [[ "${NGINX_PORT}" == "443" ]]; then
+PORT80_BUSY=0
+if ss -ltnpH "sport = :80" 2>/dev/null | grep -v nginx | grep -q .; then PORT80_BUSY=1; fi
+if [[ "${NGINX_PORT}" == "443" && ${PORT80_BUSY} -eq 1 ]]; then
+    warn "Port 80 is used by another service (e.g. apache2) - skipping the http->https redirect."
+    warn "Use https://<ip> directly. To enable the redirect later: stop that service and rerun this script."
+fi
+if [[ "${NGINX_PORT}" == "443" && ${PORT80_BUSY} -eq 0 ]]; then
     HTTP_REDIRECT_BLOCK='server {
     listen 80;
     listen [::]:80;
@@ -348,7 +354,6 @@ nginx -t || die "Nginx configuration test failed."
 
 # Is something other than nginx already using our port?
 CHECK_PORTS=("${NGINX_PORT}")
-[[ "${NGINX_PORT}" == "443" ]] && CHECK_PORTS+=(80)
 for _p in "${CHECK_PORTS[@]}"; do
     if ss -ltnpH "sport = :${_p}" 2>/dev/null | grep -v nginx | grep -q .; then
         warn "Port ${_p} is already in use by:"
@@ -371,7 +376,7 @@ fi
 if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
     log "UFW active - opening ${NGINX_PORT}/tcp..."
     ufw allow "${NGINX_PORT}/tcp"
-    [[ "${NGINX_PORT}" == "443" ]] && ufw allow 80/tcp
+    if [[ "${NGINX_PORT}" == "443" && ${PORT80_BUSY} -eq 0 ]]; then ufw allow 80/tcp; fi
 fi
 
 #--- 10. Start and test -------------------------------------------------------------
