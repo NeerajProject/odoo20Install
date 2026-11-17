@@ -7,7 +7,9 @@
 # Options (environment variables):
 #   NGINX_PORT=8020        public port served by Nginx
 #   SERVER_NAME=_          domain name (e.g. erp.example.com) or _ for any
-#   ODOO_WORKERS=2         0 = threaded mode (no gevent/websocket port)
+#   ODOO_USERS=10          expected concurrent users (workers/RAM limits are
+#                          calculated from this; asked interactively if unset)
+#   ODOO_WORKERS=          override calculated workers (0 = threaded mode)
 #   ODOO_ADMIN_PASSWD=     master password (random if empty)
 #   DB_PASSWORD=           PostgreSQL password for odoo20 (random if empty)
 #=============================================================================
@@ -23,7 +25,8 @@ ODOO_LOG="${ODOO_LOG_DIR}/odoo20.log"
 ODOO_SERVICE="odoo20"
 ODOO_PORT="8069"             # internal Odoo HTTP port
 ODOO_GEVENT_PORT="8072"      # internal Odoo websocket/longpolling port
-ODOO_WORKERS="${ODOO_WORKERS:-2}"
+ODOO_USERS="${ODOO_USERS:-}"
+ODOO_WORKERS="${ODOO_WORKERS:-}"
 
 NGINX_PORT="${NGINX_PORT:-8020}"
 SERVER_NAME="${SERVER_NAME:-_}"
@@ -56,6 +59,46 @@ fi
 if ss -ltn "( sport = :${NGINX_PORT} )" | grep -q LISTEN; then
     die "Port ${NGINX_PORT} is already in use. Free it or set NGINX_PORT=<other>."
 fi
+
+
+# ---------------------- Sizing from number of users -------------------------
+if [[ -z "${ODOO_USERS}" ]]; then
+    if [[ -t 0 ]]; then
+        read -rp "Expected number of concurrent Odoo users [10]: " ODOO_USERS
+    fi
+    ODOO_USERS="${ODOO_USERS:-10}"
+fi
+[[ "${ODOO_USERS}" =~ ^[1-9][0-9]*$ ]] || die "ODOO_USERS must be a positive integer (got '${ODOO_USERS}')"
+
+CPU_COUNT="$(nproc)"
+RAM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+
+if [[ -z "${ODOO_WORKERS}" ]]; then
+    # Rule of thumb: 1 worker serves ~6 concurrent users
+    ODOO_WORKERS=$(( (ODOO_USERS + 5) / 6 ))
+    (( ODOO_WORKERS < 2 )) && ODOO_WORKERS=2
+    MAX_BY_CPU=$(( CPU_COUNT * 2 + 1 ))
+    MAX_BY_RAM=$(( (RAM_MB - 1024) / 600 ))   # ~600 MB per worker, 1 GB for OS/PostgreSQL
+    (( MAX_BY_RAM < 2 )) && MAX_BY_RAM=2
+    if (( ODOO_WORKERS > MAX_BY_CPU )); then
+        warn "${ODOO_USERS} users need ${ODOO_WORKERS} workers but ${CPU_COUNT} CPU(s) support ${MAX_BY_CPU}. Capping."
+        ODOO_WORKERS=${MAX_BY_CPU}
+    fi
+    if (( ODOO_WORKERS > MAX_BY_RAM )); then
+        warn "${RAM_MB} MB RAM supports about ${MAX_BY_RAM} workers. Capping."
+        ODOO_WORKERS=${MAX_BY_RAM}
+    fi
+fi
+[[ "${ODOO_WORKERS}" =~ ^[0-9]+$ ]] || die "ODOO_WORKERS must be a number"
+
+# Per-worker memory limits: use up to ~70% of RAM across workers + cron
+PER_WORKER_MB=$(( RAM_MB * 70 / 100 / (ODOO_WORKERS + 2) ))
+(( PER_WORKER_MB > 2048 )) && PER_WORKER_MB=2048
+(( PER_WORKER_MB < 256 ))  && PER_WORKER_MB=256
+MEM_SOFT=$(( PER_WORKER_MB * 1024 * 1024 ))
+MEM_HARD=$(( MEM_SOFT * 5 / 4 ))
+
+log "Sizing: ${ODOO_USERS} users | ${CPU_COUNT} CPU | ${RAM_MB} MB RAM -> workers=${ODOO_WORKERS}, soft limit=${PER_WORKER_MB} MB"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -122,9 +165,39 @@ mkdir -p "${ODOO_HOME}/custom-addons"
 chown "${ODOO_USER}:${ODOO_USER}" "${ODOO_HOME}/custom-addons"
 
 # --------------------------- 6. Python venv ---------------------------------
+# Odoo 20 needs Python >= 3.12 (Ubuntu 24.04 ships it; older releases do not)
+py_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; }
+
+PYTHON_BIN=""
+for cand in python3.13 python3.12 python3; do
+    if command -v "${cand}" &>/dev/null && py_ok "$(command -v "${cand}")"; then
+        PYTHON_BIN="$(command -v "${cand}")"
+        break
+    fi
+done
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if [[ "${ID:-}" == "ubuntu" ]]; then
+        warn "System Python is older than 3.12 - installing Python 3.12 from the deadsnakes PPA..."
+        apt-get install -y software-properties-common
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update -y
+        apt-get install -y python3.12 python3.12-venv python3.12-dev
+        PYTHON_BIN="$(command -v python3.12)"
+    else
+        die "Python >= 3.12 is required but not available on ${PRETTY_NAME:-this OS}. Use Ubuntu 24.04 or install Python 3.12 manually."
+    fi
+fi
+log "Using Python: ${PYTHON_BIN} ($(${PYTHON_BIN} --version))"
+
 log "Creating Python virtual environment and installing requirements..."
+# Recreate the venv if it was built with an older Python
+if [[ -x "${ODOO_HOME}/venv/bin/python" ]] && ! py_ok "${ODOO_HOME}/venv/bin/python"; then
+    warn "Existing venv uses an old Python - recreating it."
+    rm -rf "${ODOO_HOME}/venv"
+fi
 if [[ ! -d "${ODOO_HOME}/venv" ]]; then
-    sudo -u "${ODOO_USER}" python3 -m venv "${ODOO_HOME}/venv"
+    sudo -u "${ODOO_USER}" "${PYTHON_BIN}" -m venv "${ODOO_HOME}/venv"
 fi
 sudo -u "${ODOO_USER}" "${ODOO_HOME}/venv/bin/pip" install --upgrade pip wheel
 sudo -u "${ODOO_USER}" "${ODOO_HOME}/venv/bin/pip" install -r "${ODOO_HOME}/requirements.txt"
@@ -166,8 +239,8 @@ proxy_mode = True
 
 workers = ${ODOO_WORKERS}
 max_cron_threads = 1
-limit_memory_soft = 2147483648
-limit_memory_hard = 2684354560
+limit_memory_soft = ${MEM_SOFT}
+limit_memory_hard = ${MEM_HARD}
 limit_time_cpu = 600
 limit_time_real = 1200
 list_db = True
@@ -312,6 +385,8 @@ Odoo 20 Community - installation details
 ----------------------------------------
 URL (via Nginx)       : http://${SERVER_IP}:${NGINX_PORT}
 Odoo internal         : http://127.0.0.1:${ODOO_PORT}
+Expected users        : ${ODOO_USERS}
+Odoo workers          : ${ODOO_WORKERS}
 Master (admin) pass   : ${ODOO_ADMIN_PASSWD}
 PostgreSQL user       : ${DB_USER}
 PostgreSQL password   : ${DB_PASSWORD}
@@ -329,6 +404,7 @@ else
     warn "Nginx answered with HTTP ${HTTP_CODE}. Odoo may still be starting."
     warn "Check: journalctl -u ${ODOO_SERVICE} -f   |   tail -f ${ODOO_LOG}"
 fi
+echo "  Users/workers: ${ODOO_USERS} users -> ${ODOO_WORKERS} workers"
 echo "  Open        : http://${SERVER_IP}:${NGINX_PORT}"
 echo "  Credentials : ${CRED_FILE}"
 echo "  Commands    : systemctl {status|restart} ${ODOO_SERVICE}"
