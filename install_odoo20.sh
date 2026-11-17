@@ -4,13 +4,15 @@
 #
 #  * Python 3.12 - 3.14 only (installs 3.12 via deadsnakes on Ubuntu if needed)
 #  * PostgreSQL (peer auth, no DB password), Odoo from GitHub, systemd service
-#  * Nginx reverse proxy with HTTPS on port 8020:
+#  * Nginx reverse proxy with HTTPS on port 443:
+#      - served on standard HTTPS port 443 (https://SERVER-IP), and http:// on 80
+#        redirects to https://
 #      - real domain  -> Let's Encrypt (falls back to self-signed if it fails)
 #      - no domain/IP -> self-signed certificate
 #
 # Usage:  sudo bash install_odoo20.sh
 # Options (env vars):
-#   NGINX_PORT=8020   SERVER_NAME=_ (or erp.example.com)   LE_EMAIL=you@example.com
+#   NGINX_PORT=443   SERVER_NAME=_ (or erp.example.com)   LE_EMAIL=you@example.com
 #   ODOO_BRANCH=20.0  (use master if 20.0 branch does not exist yet)
 #   WORKERS=2
 #=============================================================================
@@ -29,7 +31,7 @@ ODOO_GEVENT_PORT="8072"
 ODOO_BRANCH="${ODOO_BRANCH:-20.0}"
 ODOO_REPO="${ODOO_REPO:-https://github.com/odoo/odoo.git}"
 WORKERS="${WORKERS:-2}"
-NGINX_PORT="${NGINX_PORT:-8020}"
+NGINX_PORT="${NGINX_PORT:-443}"
 SERVER_NAME="${SERVER_NAME:-_}"
 LE_EMAIL="${LE_EMAIL:-}"
 NGINX_SITE="odoo20"
@@ -255,6 +257,18 @@ if [[ -f /proc/net/if_inet6 && "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2
     LISTEN_V6="listen [::]:${NGINX_PORT} ssl;"
 fi
 
+# When serving on 443, also answer plain http:// on port 80 with a redirect
+HTTP_REDIRECT_BLOCK=""
+if [[ "${NGINX_PORT}" == "443" ]]; then
+    HTTP_REDIRECT_BLOCK='server {
+    listen 80;
+    listen [::]:80;
+    server_name '"${SERVER_NAME}"';
+    return 301 https://$host$request_uri;
+}'
+    [[ -n "${LISTEN_V6}" ]] || HTTP_REDIRECT_BLOCK="${HTTP_REDIRECT_BLOCK/listen \[::\]:80;/}"
+fi
+
 cat > "/etc/nginx/sites-available/${NGINX_SITE}" <<EOF
 # Odoo 20 reverse proxy - HTTPS on ${NGINX_PORT}
 upstream odoo20_backend   { server 127.0.0.1:${ODOO_PORT}; }
@@ -264,6 +278,8 @@ map \$http_upgrade \$odoo20_connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+${HTTP_REDIRECT_BLOCK}
 
 server {
     listen ${NGINX_PORT} ssl;
@@ -288,7 +304,7 @@ server {
     proxy_connect_timeout 720s;
     proxy_send_timeout    720s;
 
-    proxy_set_header Host              \$host:\$server_port;
+    proxy_set_header Host              \$http_host;
     proxy_set_header X-Real-IP         \$remote_addr;
     proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
@@ -299,7 +315,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade    \$http_upgrade;
         proxy_set_header Connection \$odoo20_connection_upgrade;
-        proxy_set_header Host       \$host:\$server_port;
+        proxy_set_header Host       \$http_host;
         proxy_set_header X-Real-IP  \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -331,11 +347,15 @@ rm -f /etc/nginx/sites-enabled/default      # avoids clashes on port 80
 nginx -t || die "Nginx configuration test failed."
 
 # Is something other than nginx already using our port?
-if ss -ltnpH "sport = :${NGINX_PORT}" 2>/dev/null | grep -v nginx | grep -q .; then
-    warn "Port ${NGINX_PORT} is already in use by:"
-    ss -ltnp "sport = :${NGINX_PORT}" || true
-    die "Free the port or rerun with another one, e.g.  NGINX_PORT=8443 sudo -E bash $0"
-fi
+CHECK_PORTS=("${NGINX_PORT}")
+[[ "${NGINX_PORT}" == "443" ]] && CHECK_PORTS+=(80)
+for _p in "${CHECK_PORTS[@]}"; do
+    if ss -ltnpH "sport = :${_p}" 2>/dev/null | grep -v nginx | grep -q .; then
+        warn "Port ${_p} is already in use by:"
+        ss -ltnp "sport = :${_p}" || true
+        die "Stop that service (e.g. 'sudo systemctl disable --now apache2') or use another port: NGINX_PORT=8443 sudo -E bash $0"
+    fi
+done
 
 systemctl enable nginx >/dev/null 2>&1
 if ! systemctl restart nginx; then
@@ -351,6 +371,7 @@ fi
 if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
     log "UFW active - opening ${NGINX_PORT}/tcp..."
     ufw allow "${NGINX_PORT}/tcp"
+    [[ "${NGINX_PORT}" == "443" ]] && ufw allow 80/tcp
 fi
 
 #--- 10. Start and test -------------------------------------------------------------
@@ -376,10 +397,13 @@ ODOO_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ODOO_POR
 NGINX_CODE="$(curl -k -s -o /dev/null -w '%{http_code}' "https://127.0.0.1:${NGINX_PORT}/web/login" || true)"
 IP="$(hostname -I | awk '{print $1}')"
 HOST_SHOWN="${IP}"; [[ "${SERVER_NAME}" =~ ${DOMAIN_RE} ]] && HOST_SHOWN="${SERVER_NAME}"
+URL_PORT=""
+if [[ "${NGINX_PORT}" != "443" ]]; then URL_PORT=":${NGINX_PORT}"; fi
+ODOO_URL="https://${HOST_SHOWN}${URL_PORT}"
 
 umask 077
 cat > "${CRED_FILE}" <<EOF
-Odoo URL        : https://${HOST_SHOWN}:${NGINX_PORT}
+Odoo URL        : ${ODOO_URL}
 Master password : ${ADMIN_PASSWD}
 Config file     : ${ODOO_CONF}
 Log file        : ${ODOO_LOG_DIR}/odoo20.log
@@ -391,6 +415,6 @@ echo "  Python : ${PYV}"
 echo "  Odoo   (:${ODOO_PORT}) -> HTTP ${ODOO_CODE}"
 echo "  Nginx  (:${NGINX_PORT}) -> HTTP ${NGINX_CODE}"
 echo "  SSL    : ${SSL_TYPE}"
-echo "  Open   : https://${HOST_SHOWN}:${NGINX_PORT}"
+echo "  Open   : ${ODOO_URL}"
 echo "  Master password saved in ${CRED_FILE}"
 echo "=============================================================="
