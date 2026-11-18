@@ -1,0 +1,158 @@
+name: Deploy Odoo 20
+
+# Single instance.
+#   Push to main that changes custom-addons/  -> addons are synced + Odoo restarted
+#   Manual run (Actions -> Deploy Odoo 20)    -> sync addons, or run the installer
+on:
+  push:
+    branches: [main]
+    paths:
+      - "custom-addons/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        type: choice
+        default: sync-addons-only
+        options:
+          - sync-addons-only      # copy ./custom-addons and restart Odoo
+          - install-or-update     # run install_odoo20_single.sh on the server
+      rebuild:
+        description: "REBUILD=1 (rebuild image, pull newest Odoo code)"
+        type: boolean
+        default: false
+      reconfigure:
+        description: "RECONFIGURE=1 (regenerate odoo.conf, old one saved as .bak)"
+        type: boolean
+        default: false
+      demo:
+        description: "DEMO=1 (demo data in a newly created database)"
+        type: boolean
+        default: false
+      python_version:
+        description: "Python version"
+        type: choice
+        default: "3.12"
+        options: ["3.12", "3.13", "3.14"]
+      odoo_branch:
+        description: "Odoo source branch (20.0 or master)"
+        type: string
+        default: "20.0"
+      pip_packages:
+        description: "Extra pip packages (optional)"
+        type: string
+        default: ""
+
+concurrency:
+  group: odoo-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BASE_DIR: /opt/odoo20-docker
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve action
+        env:
+          IN_ACTION: ${{ inputs.action }}
+          PORT_VAR: ${{ vars.HTTP_PORT }}
+        run: |
+          # push events have no inputs -> default to the safe action
+          echo "ACTION=${IN_ACTION:-sync-addons-only}" >> "$GITHUB_ENV"
+          echo "PORT=${PORT_VAR:-80}" >> "$GITHUB_ENV"
+
+      - name: Set up SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [[ -n "${SSH_KNOWN_HOSTS:-}" ]]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "${SSH_PORT:-22}" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          fi
+          {
+            echo "Host odoo-server"
+            echo "  HostName ${SSH_HOST}"
+            echo "  User ${SSH_USER}"
+            echo "  Port ${SSH_PORT:-22}"
+            echo "  IdentityFile ~/.ssh/id_deploy"
+            echo "  IdentitiesOnly yes"
+            echo "  ServerAliveInterval 30"
+            echo "  ServerAliveCountMax 20"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Test SSH connection
+        run: ssh odoo-server 'echo "Connected to $(hostname)"; sudo -n true && echo "sudo OK"'
+
+      - name: Upload installer script
+        if: env.ACTION == 'install-or-update'
+        run: |
+          set -euo pipefail
+          test -f install_odoo20_single.sh || { echo "install_odoo20_single.sh not found in repo root"; exit 1; }
+          scp install_odoo20_single.sh odoo-server:/tmp/install_odoo20_single.sh
+
+      - name: Run installer on server
+        if: env.ACTION == 'install-or-update'
+        env:
+          IN_REBUILD: ${{ inputs.rebuild }}
+          IN_RECONFIGURE: ${{ inputs.reconfigure }}
+          IN_DEMO: ${{ inputs.demo }}
+          IN_PYTHON: ${{ inputs.python_version }}
+          IN_ODOO_BRANCH: ${{ inputs.odoo_branch }}
+          IN_PIP: ${{ inputs.pip_packages }}
+        run: |
+          set -euo pipefail
+          b() { [[ "$1" == "true" ]] && echo 1 || echo 0; }
+          {
+            printf 'export REBUILD=%q\n'        "$(b "$IN_REBUILD")"
+            printf 'export RECONFIGURE=%q\n'    "$(b "$IN_RECONFIGURE")"
+            printf 'export DEMO=%q\n'           "$(b "$IN_DEMO")"
+            printf 'export PYTHON_VERSION=%q\n' "$IN_PYTHON"
+            printf 'export ODOO_BRANCH=%q\n'    "$IN_ODOO_BRANCH"
+            printf 'export BASE_DIR=%q\n'       "$BASE_DIR"
+            printf 'export PORT=%q\n'           "$PORT"
+            [[ -n "$IN_PIP" ]] && printf 'export PIP_PACKAGES=%q\n' "$IN_PIP"
+            true
+          } > deploy.env
+          scp deploy.env odoo-server:/tmp/odoo_deploy.env
+          ssh odoo-server 'sudo bash -c "set -a; . /tmp/odoo_deploy.env; set +a; bash /tmp/install_odoo20_single.sh"; rc=$?; rm -f /tmp/odoo_deploy.env /tmp/install_odoo20_single.sh; exit $rc'
+
+      - name: Sync custom addons and restart Odoo
+        if: env.ACTION == 'sync-addons-only'
+        run: |
+          set -euo pipefail
+          test -d custom-addons || { echo "No ./custom-addons directory in the repo"; exit 1; }
+          tar -czf - -C custom-addons . | ssh odoo-server \
+            "sudo mkdir -p '$BASE_DIR/custom-addons' && sudo tar -xzf - -C '$BASE_DIR/custom-addons'"
+          ssh odoo-server "cd '$BASE_DIR' && sudo docker compose restart odoo && sudo docker compose restart nginx"
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+          ssh odoo-server "for i in \$(seq 1 60); do
+              if curl -sf -o /dev/null http://127.0.0.1:$PORT/web/login; then echo 'Odoo OK'; exit 0; fi
+              sleep 3
+            done
+            echo 'Odoo did not answer'; cd '$BASE_DIR' && sudo docker compose logs --tail 40 odoo; exit 1"
+
+      - name: Clean up
+        if: always()
+        run: rm -rf ~/.ssh/id_deploy ~/.ssh/config deploy.env
