@@ -3,7 +3,8 @@
 # install_odoo20.sh - full Odoo 20 install (Ubuntu 22.04 / 24.04, Debian 13)
 #
 #  * Python 3.12 - 3.14 only (installs 3.12 via deadsnakes on Ubuntu if needed)
-#  * PostgreSQL (peer auth, no DB password), Odoo from GitHub, systemd service
+#  * PostgreSQL 16+ (Odoo 20 needs it; adds the official PGDG repo if the distro
+#    ships an older one), peer auth, no DB password, Odoo from GitHub, systemd service
 #  * Nginx reverse proxy with HTTPS on port 443:
 #      - served on standard HTTPS port 443 (https://SERVER-IP), and http:// on 80
 #        redirects to https://
@@ -14,7 +15,8 @@
 # Options (env vars):
 #   NGINX_PORT=443   SERVER_NAME=_ (or erp.example.com)   LE_EMAIL=you@example.com
 #   ODOO_BRANCH=20.0  (use master if 20.0 branch does not exist yet)
-#   WORKERS=2
+#   WORKERS=2   PG_VERSION=16
+#   DB_NAME=odoo   database to create (DB_NAME= to skip)   DEMO=1  load demo data
 #=============================================================================
 set -Eeuo pipefail
 trap 'echo -e "\033[0;31m[x]\033[0m Failed at line $LINENO" >&2' ERR
@@ -56,7 +58,7 @@ apt-get install -y git curl wget ca-certificates openssl gnupg \
     build-essential libpq-dev libxml2-dev libxslt1-dev libldap2-dev \
     libsasl2-dev libssl-dev libffi-dev libjpeg-dev zlib1g-dev \
     libopenjp2-7-dev libwebp-dev liblcms2-dev fontconfig xfonts-75dpi \
-    xfonts-base postgresql postgresql-client
+    xfonts-base postgresql-common
 
 #--- 2. Python 3.12 - 3.14 ----------------------------------------------------
 py_ok() {
@@ -120,12 +122,32 @@ mkdir -p "${ODOO_HOME}" "${ODOO_LOG_DIR}" "${ODOO_HOME}/custom-addons"
 chown -R "${ODOO_USER}:${ODOO_USER}" "${ODOO_HOME}"
 chown "${ODOO_USER}:root" "${ODOO_LOG_DIR}"
 
-#--- 5. PostgreSQL role (peer authentication, no password) --------------------
-log "Configuring PostgreSQL..."
+#--- 5. PostgreSQL 16+ and role (peer authentication, no password) ----------
+PG_VERSION="${PG_VERSION:-16}"
+log "Configuring PostgreSQL ${PG_VERSION}..."
+if ! apt-cache show "postgresql-${PG_VERSION}" &>/dev/null; then
+    log "postgresql-${PG_VERSION} not in ${PRETTY_NAME} repos - adding the official PostgreSQL (PGDG) repository..."
+    install -d /usr/share/postgresql-common/pgdg
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list
+    apt-get update -y
+fi
+apt-get install -y "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
 systemctl enable --now postgresql
+
+# If an older cluster (e.g. 14) already existed, the new one listens on 5433 etc.
+PG_PORT="$(pg_lsclusters -h 2>/dev/null | awk -v v="${PG_VERSION}" '$1==v && $2=="main" {print $3}')"
+PG_PORT="${PG_PORT:-5432}"
+pg_ctlcluster "${PG_VERSION}" main start 2>/dev/null || true
+for _ in $(seq 1 20); do pg_isready -q -p "${PG_PORT}" && break; sleep 1; done
+pg_isready -q -p "${PG_PORT}" || die "PostgreSQL ${PG_VERSION} is not accepting connections on port ${PG_PORT}."
+log "PostgreSQL ${PG_VERSION} running on port ${PG_PORT}."
+
 cd /
-if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'" | grep -q 1; then
-    runuser -u postgres -- psql -c "CREATE ROLE ${ODOO_USER} LOGIN CREATEDB;"
+if ! runuser -u postgres -- psql -p "${PG_PORT}" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'" | grep -q 1; then
+    runuser -u postgres -- psql -p "${PG_PORT}" -c "CREATE ROLE ${ODOO_USER} LOGIN CREATEDB;"
 fi
 
 #--- 6. Odoo source -------------------------------------------------------------
@@ -162,7 +184,7 @@ cat > "${ODOO_CONF}" <<EOF
 [options]
 admin_passwd = ${ADMIN_PASSWD}
 db_host = False
-db_port = False
+db_port = ${PG_PORT}
 db_user = ${ODOO_USER}
 db_password = False
 addons_path = ${ODOO_SRC}/addons,${ODOO_HOME}/custom-addons
@@ -379,6 +401,37 @@ if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
     if [[ "${NGINX_PORT}" == "443" && ${PORT80_BUSY} -eq 0 ]]; then ufw allow 80/tcp; fi
 fi
 
+#--- 9b. Create and initialise the database -------------------------------------
+# An existing, initialised database is left alone; an empty/half-built one is recreated.
+DB_NAME="${DB_NAME-odoo}"
+DEMO="${DEMO:-0}"
+DB_STATUS="skipped"
+if [[ -n "${DB_NAME}" ]]; then
+    [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]] || die "DB_NAME may only contain letters, digits and _"
+    cd /
+    systemctl stop "${ODOO_SERVICE}" 2>/dev/null || true
+    DB_EXISTS="$(runuser -u "${ODOO_USER}" -- psql -p "${PG_PORT}" -d postgres -tAc \
+        "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null || true)"
+    DB_INIT="f"
+    if [[ "${DB_EXISTS}" == "1" ]]; then
+        DB_INIT="$(runuser -u "${ODOO_USER}" -- psql -p "${PG_PORT}" -d "${DB_NAME}" -tAc \
+            "SELECT to_regclass('public.ir_module_module') IS NOT NULL" 2>/dev/null || echo f)"
+    fi
+    if [[ "${DB_INIT}" == "t" ]]; then
+        log "Database ${DB_NAME} already initialised - keeping it."
+        DB_STATUS="existing"
+    else
+        log "Creating database ${DB_NAME} and installing base modules (a few minutes)..."
+        runuser -u "${ODOO_USER}" -- dropdb -p "${PG_PORT}" --if-exists "${DB_NAME}"
+        runuser -u "${ODOO_USER}" -- createdb -p "${PG_PORT}" -E UTF8 -T template0 "${DB_NAME}"
+        DEMO_FLAG="--without-demo=all"; [[ "${DEMO}" == "1" ]] && DEMO_FLAG=""
+        runuser -u "${ODOO_USER}" -- "${ODOO_VENV}/bin/python" "${ODOO_SRC}/odoo-bin" \
+            -c "${ODOO_CONF}" -d "${DB_NAME}" -i base ${DEMO_FLAG} --stop-after-init \
+            || die "Database initialisation failed - see the output above."
+        DB_STATUS="created (login: admin / admin)"
+    fi
+fi
+
 #--- 10. Start and test -------------------------------------------------------------
 log "Starting Odoo..."
 systemctl daemon-reload
@@ -410,6 +463,8 @@ umask 077
 cat > "${CRED_FILE}" <<EOF
 Odoo URL        : ${ODOO_URL}
 Master password : ${ADMIN_PASSWD}
+Database        : ${DB_NAME:-none} (${DB_STATUS})
+Web login       : admin / admin  (CHANGE IT after first login)
 Config file     : ${ODOO_CONF}
 Log file        : ${ODOO_LOG_DIR}/odoo20.log
 EOF
@@ -421,5 +476,6 @@ echo "  Odoo   (:${ODOO_PORT}) -> HTTP ${ODOO_CODE}"
 echo "  Nginx  (:${NGINX_PORT}) -> HTTP ${NGINX_CODE}"
 echo "  SSL    : ${SSL_TYPE}"
 echo "  Open   : ${ODOO_URL}"
+echo "  DB     : ${DB_NAME:-none} - ${DB_STATUS}"
 echo "  Master password saved in ${CRED_FILE}"
 echo "=============================================================="
