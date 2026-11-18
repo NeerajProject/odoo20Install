@@ -4,7 +4,7 @@
 #
 #  * Python 3.12 - 3.14 only (installs 3.12 via deadsnakes on Ubuntu if needed)
 #  * PostgreSQL 16+ (Odoo 20 needs it; adds the official PGDG repo if the distro
-#    ships an older one), peer auth, no DB password, Odoo from GitHub, systemd service
+#    ships an older one), DB role + random passwords generated automatically, Odoo from GitHub, systemd service
 #  * Nginx reverse proxy with HTTPS on port 443:
 #      - served on standard HTTPS port 443 (https://SERVER-IP), and http:// on 80
 #        redirects to https://
@@ -46,6 +46,7 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
+gen_pass() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-"${1:-24}"; }
 
 [[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0"
 . /etc/os-release
@@ -122,7 +123,7 @@ mkdir -p "${ODOO_HOME}" "${ODOO_LOG_DIR}" "${ODOO_HOME}/custom-addons"
 chown -R "${ODOO_USER}:${ODOO_USER}" "${ODOO_HOME}"
 chown "${ODOO_USER}:root" "${ODOO_LOG_DIR}"
 
-#--- 5. PostgreSQL 16+ and role (peer authentication, no password) ----------
+#--- 5. PostgreSQL 16+ and role (random password) ----------
 PG_VERSION="${PG_VERSION:-16}"
 log "Configuring PostgreSQL ${PG_VERSION}..."
 if ! apt-cache show "postgresql-${PG_VERSION}" &>/dev/null; then
@@ -146,8 +147,13 @@ pg_isready -q -p "${PG_PORT}" || die "PostgreSQL ${PG_VERSION} is not accepting 
 log "PostgreSQL ${PG_VERSION} running on port ${PG_PORT}."
 
 cd /
-if ! runuser -u postgres -- psql -p "${PG_PORT}" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'" | grep -q 1; then
-    runuser -u postgres -- psql -p "${PG_PORT}" -c "CREATE ROLE ${ODOO_USER} LOGIN CREATEDB;"
+DB_PASSWD="$(gen_pass 24)"
+if runuser -u postgres -- psql -p "${PG_PORT}" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'" | grep -q 1; then
+    log "Resetting password of PostgreSQL role ${ODOO_USER}..."
+    runuser -u postgres -- psql -p "${PG_PORT}" -c "ALTER ROLE ${ODOO_USER} WITH LOGIN CREATEDB PASSWORD '${DB_PASSWD}';" >/dev/null
+else
+    log "Creating PostgreSQL role ${ODOO_USER} with a random password..."
+    runuser -u postgres -- psql -p "${PG_PORT}" -c "CREATE ROLE ${ODOO_USER} LOGIN CREATEDB PASSWORD '${DB_PASSWD}';" >/dev/null
 fi
 
 #--- 6. Odoo source -------------------------------------------------------------
@@ -177,16 +183,16 @@ if [[ -f "${ODOO_CONF}" ]] && grep -q '^admin_passwd' "${ODOO_CONF}"; then
     ADMIN_PASSWD="$(sed -nE 's/^admin_passwd[[:space:]]*=[[:space:]]*//p' "${ODOO_CONF}" | head -1)"
     log "Keeping existing master password."
 else
-    ADMIN_PASSWD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
+    ADMIN_PASSWD="$(gen_pass 20)"
 fi
 
 cat > "${ODOO_CONF}" <<EOF
 [options]
 admin_passwd = ${ADMIN_PASSWD}
-db_host = False
+db_host = 127.0.0.1
 db_port = ${PG_PORT}
 db_user = ${ODOO_USER}
-db_password = False
+db_password = ${DB_PASSWD}
 addons_path = ${ODOO_SRC}/addons,${ODOO_HOME}/custom-addons
 logfile = ${ODOO_LOG_DIR}/odoo20.log
 data_dir = ${ODOO_HOME}/.local/share/Odoo
@@ -406,6 +412,7 @@ fi
 DB_NAME="${DB_NAME-odoo}"
 DEMO="${DEMO:-0}"
 DB_STATUS="skipped"
+WEB_PASSWD="(unchanged)"
 if [[ -n "${DB_NAME}" ]]; then
     [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]] || die "DB_NAME may only contain letters, digits and _"
     cd /
@@ -427,8 +434,38 @@ if [[ -n "${DB_NAME}" ]]; then
         DEMO_FLAG="--without-demo=all"; [[ "${DEMO}" == "1" ]] && DEMO_FLAG=""
         runuser -u "${ODOO_USER}" -- "${ODOO_VENV}/bin/python" "${ODOO_SRC}/odoo-bin" \
             -c "${ODOO_CONF}" -d "${DB_NAME}" -i base ${DEMO_FLAG} --stop-after-init \
-            || die "Database initialisation failed - see the output above."
-        DB_STATUS="created (login: admin / admin)"
+            --logfile= --log-level=info \
+            || {
+                warn "Database initialisation failed. Last lines of the Odoo log:"
+                echo "------------------------------------------------------------"
+                tail -n 50 "${ODOO_LOG_DIR}/odoo20.log" 2>/dev/null || true
+                echo "------------------------------------------------------------"
+                die "Initialisation failed - paste the error above (the last ERROR/CRITICAL lines)."
+            }
+        DB_STATUS="created"
+        WEB_PASSWD="$(gen_pass 16)"
+        SHELL_OUT="$(cat <<'PYEOF' | ODOO_WEB_PW="${WEB_PASSWD}" runuser -u "${ODOO_USER}" -- env ODOO_WEB_PW="${WEB_PASSWD}" \
+            "${ODOO_VENV}/bin/python" "${ODOO_SRC}/odoo-bin" shell -c "${ODOO_CONF}" -d "${DB_NAME}" --logfile= 2>&1 || true
+import os
+pw = os.environ['ODOO_WEB_PW']
+u = env.ref('base.user_admin')
+u.write({'password': pw})
+env.cr.commit()
+try:
+    u._check_credentials({'type': 'password', 'password': pw}, {'interactive': False})
+    print('WEBPW_OK')
+except Exception as e:
+    u.write({'password': 'admin'})
+    env.cr.commit()
+    print('WEBPW_FAIL', e)
+PYEOF
+)"
+        if grep -q "WEBPW_OK" <<<"${SHELL_OUT}"; then
+            log "Random password set for web user 'admin'."
+        else
+            WEB_PASSWD="admin"
+            warn "Could not set a random web password - login is admin / admin, CHANGE IT after first login."
+        fi
     fi
 fi
 
@@ -464,7 +501,8 @@ cat > "${CRED_FILE}" <<EOF
 Odoo URL        : ${ODOO_URL}
 Master password : ${ADMIN_PASSWD}
 Database        : ${DB_NAME:-none} (${DB_STATUS})
-Web login       : admin / admin  (CHANGE IT after first login)
+Web login       : admin / ${WEB_PASSWD}
+PostgreSQL role : ${ODOO_USER} / ${DB_PASSWD}  (127.0.0.1:${PG_PORT})
 Config file     : ${ODOO_CONF}
 Log file        : ${ODOO_LOG_DIR}/odoo20.log
 EOF
@@ -477,5 +515,6 @@ echo "  Nginx  (:${NGINX_PORT}) -> HTTP ${NGINX_CODE}"
 echo "  SSL    : ${SSL_TYPE}"
 echo "  Open   : ${ODOO_URL}"
 echo "  DB     : ${DB_NAME:-none} - ${DB_STATUS}"
+echo "  Login  : admin / ${WEB_PASSWD}"
 echo "  Master password saved in ${CRED_FILE}"
 echo "=============================================================="
